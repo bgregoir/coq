@@ -108,6 +108,23 @@ if (sp - num_args < coq_stack_threshold) {                                     \
  }                                                                             \
 }
 
+#define ALLOC_GRAB(num_args, tag, env, pc) do                                       \
+{                                                                              \
+  if (num_args + 2 <= Max_young_wosize) {                                      \
+    Alloc_small(accu, num_args + 2, tag);                                      \
+    Field(accu, 1) = env;                                                      \
+    for (i = 0; i < num_args; i++) Field(accu, i + 2) = sp[i];                 \
+  } else {                                                                     \
+    /* caml_alloc_shr and caml_initialize never trigger a GC,                  \
+        so no need to Setup_for_gc */                                          \
+    accu = caml_alloc_shr(num_args + 2, tag);                                  \
+    caml_initialize(&Field(accu,1), env);                                      \
+    for(i = 0; i < num_args; i++) caml_initialize(&Field(accu, i + 2), sp[i]); \
+  }                                                                            \
+  Code_val(accu) = pc;                                                         \
+  sp += num_args;                                                              \
+} while(0)
+
 /* GC interface */
 #define Setup_for_gc { sp -= 2; sp[0] = accu; sp[1] = coq_env; coq_sp = sp; }
 #define Restore_after_gc { accu = sp[0]; coq_env = sp[1]; sp += 2; }
@@ -661,11 +678,7 @@ value coq_interprete
         } else {
           mlsize_t num_args, i;
           num_args = 1 + coq_extra_args; /* arg1 + extra args */
-          Alloc_small(accu, num_args + 2, Closure_tag);
-          Field(accu, 1) = coq_env;
-          for (i = 0; i < num_args; i++) Field(accu, i + 2) = sp[i];
-          Code_val(accu) = pc - 3; /* Point to the preceding RESTART instr. */
-          sp += num_args;
+          ALLOC_GRAB(num_args, Closure_tag, coq_env, pc - 3);
           pc = (code_t)(sp[0]);
           coq_env = sp[1];
           coq_extra_args = Long_val(sp[2]);
@@ -684,42 +697,27 @@ value coq_interprete
             /* Partial application */
             mlsize_t num_args, i;
             num_args = 1 + coq_extra_args; /* arg1 + extra args */
-            Alloc_small(accu, num_args + 2, Closure_tag);
-            Field(accu, 1) = coq_env;
-            for (i = 0; i < num_args; i++) Field(accu, i + 2) = sp[i];
-            Code_val(accu) = pc - 3;
-            sp += num_args;
-            pc = (code_t)(sp[0]);
-            coq_env = sp[1];
-            coq_extra_args = Long_val(sp[2]);
-            sp += 3;
+            ALLOC_GRAB(num_args, Closure_tag, coq_env, pc - 3);
           } else {
             /* The recursif argument is an accumulator */
             mlsize_t num_args, i;
             /* Construction of fixpoint applied to its [rec_pos-1] first arguments */
-            Alloc_small(accu, rec_pos + 2, Closure_tag);
-            Field(accu, 1) = coq_env; // We store the fixpoint in the first field
-            for (i = 0; i < rec_pos; i++) Field(accu, i + 2) = sp[i]; // Storing args
-            Code_val(accu) = pc;
-            sp += rec_pos;
+            ALLOC_GRAB(rec_pos, Closure_tag, coq_env, pc);
             *--sp = accu;
               /* Construction of the atom */
             Alloc_small(accu, 2, ATOM_FIX_TAG);
             Field(accu,1) = sp[0];
             Field(accu,0)  = sp[1];
-            sp++; sp[0] = accu;
+            sp += 2;
+            coq_env = accu;
               /* Construction of the accumulator */
             num_args = coq_extra_args - rec_pos;
-            Alloc_small(accu, 2+num_args, Accu_tag);
-            Code_val(accu) = accumulate;
-            Field(accu,1) = sp[0]; sp++;
-            for (i = 0; i < num_args;i++)Field(accu, i + 2) = sp[i];
-            sp += num_args;
-            pc = (code_t)(sp[0]);
-            coq_env = sp[1];
-            coq_extra_args = Long_val(sp[2]);
-            sp += 3;
+            ALLOC_GRAB(num_args, Accu_tag, coq_env, accumulate);
           }
+          pc = (code_t)(sp[0]);
+          coq_env = sp[1];
+          coq_extra_args = Long_val(sp[2]);
+          sp += 3;
         }
         Next;
       }
@@ -730,13 +728,15 @@ value coq_interprete
         print_instr("CLOSURE");
         print_int(nvars);
         if (nvars > 0) *--sp = accu;
-        Alloc_small(accu, 1 + nvars, Closure_tag);
+        if (nvars + 1 <= Max_young_wosize) {
+          Alloc_small(accu, nvars + 1, Closure_tag);
+          for (i = 0; i < nvars; i++) Field(accu, i + 1) = sp[i];
+        } else {
+          accu = caml_alloc_shr(nvars + 1, Closure_tag);
+          for(i = 0; i < nvars; i++) caml_initialize(&Field(accu, i + 1), sp[i]);
+        }
         Code_val(accu) = pc + *pc;
         pc++;
-        for (i = 0; i < nvars; i++) {
-          print_lint(sp[i]);
-          Field(accu, i + 1) = sp[i];
-        }
         sp += nvars;
         Next;
       }
@@ -750,19 +750,31 @@ value coq_interprete
         print_instr("CLOSUREREC");
         if (nvars > 0) *--sp = accu;
         /* construction du vecteur de type */
-        Alloc_small(accu, nfuncs, Abstract_tag);
-        for(i = 0; i < nfuncs; i++) {
-          Field(accu,i) = (value)(pc+pc[i]);
+        if (nfuncs <= Max_young_wosize) {
+          Alloc_small(accu, nfuncs, Abstract_tag);
+          for(i = 0; i < nfuncs; i++) Field(accu,i) = (value)(pc+pc[i]);
+        } else {
+          accu = caml_alloc_shr(nfuncs, Abstract_tag);
+          for(i = 0; i < nfuncs; i++) caml_initialize(&Field(accu, i), (value)(pc+pc[i]));
         }
+
+
         pc += nfuncs;
         *--sp=accu;
-        Alloc_small(accu, nfuncs * 2 + nvars, Closure_tag);
-        Field(accu, nfuncs * 2 + nvars - 1) = *sp++;
-        /* On remplie la partie pour les variables libres */
-        p = &Field(accu, nfuncs * 2 - 1);
-        for (i = 0; i < nvars; i++) {
-          *p++ = *sp++;
+        if (nfuncs * 2 + nvars <= Max_young_wosize) {
+          Alloc_small(accu, nfuncs * 2 + nvars, Closure_tag);
+          Field(accu, nfuncs * 2 + nvars - 1) = *sp++;
+          /* On remplie la partie pour les variables libres */
+          p = &Field(accu, nfuncs * 2 - 1);
+          for (i = 0; i < nvars; i++) *p++ = *sp++;
+        } else {
+          accu = caml_alloc_shr(nfuncs * 2 + nvars, Closure_tag);
+          caml_initialize(&Field(accu, nfuncs * 2 + nvars - 1), *sp++);
+          p = &Field(accu, nfuncs * 2 - 1);
+          for (i = 0; i < nvars; i++) caml_initialize(p + i, sp[i]);
+          sp += nvars;
         }
+        /* The remaining part only copy header or code pointer */
         p = &Field(accu, 0);
         *p = (value) (pc + pc[0]);
         p++;
@@ -786,9 +798,12 @@ value coq_interprete
         print_instr("CLOSURECOFIX");
         if (nvars > 0) *--sp = accu;
         /* construction du vecteur de type */
-        Alloc_small(accu, nfunc, Abstract_tag);
-        for(i = 0; i < nfunc; i++) {
-          Field(accu,i) = (value)(pc+pc[i]);
+        if (nfunc <= Max_young_wosize) {
+          Alloc_small(accu, nfunc, Abstract_tag);
+          for(i = 0; i < nfunc; i++) Field(accu,i) = (value)(pc+pc[i]);
+        } else {
+          accu = caml_alloc_shr(nfunc, Abstract_tag);
+          for(i = 0; i < nfunc; i++) caml_initialize(&Field(accu, i), (value)(pc+pc[i]));
         }
         pc += nfunc;
         *--sp=accu;
@@ -800,17 +815,18 @@ value coq_interprete
           Field(accu,1) = Val_int(1);
           *--sp=accu;
         }
-        /* creation des fonction cofix */
+        /* creation des fonctions cofix */
 
         p = sp;
         size = nfunc + nvars + 2;
         for (i=0; i < nfunc; i++) {
-
-          Alloc_small(accu, size, Closure_tag);
+          accu = caml_alloc_shr(size, Closure_tag);
           Code_val(accu) = pc+pc[i];
-          for (j = 0; j < nfunc; j++) Field(accu, j+1) = p[j];
-          Field(accu, size - 1) = p[nfunc];
-          for (j = nfunc+1; j <= nfunc+nvars; j++) Field(accu, j) = p[j];
+          for (j = 0; j < nfunc; j++)
+            caml_initialize(&Field(accu, j+1), p[j]);
+          caml_initialize(&Field(accu, size - 1), p[nfunc]);
+          for (j = nfunc+1; j <= nfunc+nvars; j++)
+            caml_initialize(&Field(accu, j), p[j]);
           *--sp = accu;
           /* creation du block contenant le cofix */
 
@@ -824,10 +840,8 @@ value coq_interprete
         pc += nfunc;
         accu = p[start];
         sp = p + nfunc + 1 + nvars;
-        print_instr("ici4");
         Next;
       }
-
 
       Instruct(PUSHOFFSETCLOSURE) {
         print_instr("PUSHOFFSETCLOSURE");
@@ -885,9 +899,15 @@ value coq_interprete
         mlsize_t i;
         value block;
         print_instr("MAKEBLOCK, tag=");
-        Alloc_small(block, wosize, tag);
-        Field(block, 0) = accu;
-        for (i = 1; i < wosize; i++) Field(block, i) = *sp++;
+        if (wosize <= Max_young_wosize) {
+          Alloc_small(block, wosize, tag);
+          Field(block, 0) = accu;
+          for (i = 1; i < wosize; i++) Field(block, i) = *sp++;
+        } else {
+          block = caml_alloc_shr(wosize, tag);
+          Field(block, 0) = accu;
+          for (i = 1; i < wosize; i++) caml_initialize(&Field(block, i), *sp++);
+        }
         accu = block;
         Next;
       }
@@ -1120,16 +1140,25 @@ value coq_interprete
         mlsize_t i, size;
         print_instr("ACCUMULATE");
         size = Wosize_val(coq_env);
-        Alloc_small(accu, size + coq_extra_args + 1, Accu_tag);
-        for(i = 0; i < size; i++) Field(accu, i) = Field(coq_env, i);
-        for(i = size; i <= coq_extra_args + size; i++)
-          Field(accu, i) = *sp++;
+        if (size + coq_extra_args + 1) {
+          Alloc_small(accu, size + coq_extra_args + 1, Accu_tag);
+          for(i = 0; i < size; i++) Field(accu, i) = Field(coq_env, i);
+          for(i = size; i <= coq_extra_args + size; i++)
+            Field(accu, i) = *sp++;
+        } else {
+          accu = caml_alloc_shr(size + coq_extra_args + 1, Accu_tag);
+          for(i = 0; i < size; i++)
+            caml_initialize(&Field(accu, i), Field(coq_env, i));
+          for(i = size; i <= coq_extra_args + size; i++)
+            caml_initialize(&Field(accu, i), *sp++);
+        }
         pc = (code_t)(sp[0]);
         coq_env = sp[1];
         coq_extra_args = Long_val(sp[2]);
         sp += 3;
         Next;
       }
+
       Instruct(MAKESWITCHBLOCK) {
         print_instr("MAKESWITCHBLOCK");
         *--sp = accu; // Save matched block on stack
@@ -1184,11 +1213,20 @@ value coq_interprete
             /* We save the stack */
             if (sz == 0) accu = Atom(0);
             else {
-              Alloc_small(accu, sz, Default_tag);
-              if (Field(*sp, 2) == Val_true) {
-                for (i = 0; i < sz; i++) Field(accu, i) = sp[i+2];
-              }else{
-                for (i = 0; i < sz; i++) Field(accu, i) = sp[i+5];
+              if (sz <= Max_young_wosize) {
+                Alloc_small(accu, sz, Default_tag);
+                if (Field(*sp, 2) == Val_true) {
+                  for (i = 0; i < sz; i++) Field(accu, i) = sp[i+2];
+                }else{
+                  for (i = 0; i < sz; i++) Field(accu, i) = sp[i+5];
+                }
+              } else {
+                accu = caml_alloc_shr(sz, Default_tag);
+                if (Field(*sp, 2) == Val_true) {
+                  for (i = 0; i < sz; i++) caml_initialize(&Field(accu, i), sp[i+2]);
+                }else{
+                  for (i = 0; i < sz; i++) caml_initialize(&Field(accu, i), sp[i+5]);
+                }
               }
             }
             *--sp = accu;
@@ -1226,10 +1264,17 @@ value coq_interprete
       Instruct(MAKEACCU) {
         int i;
         print_instr("MAKEACCU");
-        Alloc_small(accu, coq_extra_args + 3, Accu_tag);
-        Code_val(accu) = accumulate;
-        Field(accu,1) = Field(coq_atom_tbl, *pc);
-        for(i = 2; i < coq_extra_args + 3; i++) Field(accu, i) = *sp++;
+        if (coq_extra_args + 3 <= Max_young_wosize) {
+          Alloc_small(accu, coq_extra_args + 3, Accu_tag);
+          Code_val(accu) = accumulate;
+          Field(accu,1) = Field(coq_atom_tbl, *pc);
+          for(i = 2; i < coq_extra_args + 3; i++) Field(accu, i) = *sp++;
+        } else {
+          accu = caml_alloc_shr(coq_extra_args + 3, Accu_tag);
+          Code_val(accu) = accumulate;
+          caml_initialize(&Field(accu,1), Field(coq_atom_tbl, *pc));
+          for(i = 2; i < coq_extra_args + 3; i++) caml_initialize(&Field(accu, i), *sp++);
+        }
         pc = (code_t)(sp[0]);
         coq_env = sp[1];
         coq_extra_args = Long_val(sp[2]);
