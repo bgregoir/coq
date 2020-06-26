@@ -48,6 +48,9 @@ stdenv.mkDerivation rec {
     ocamlPackages.lablgtk3-sourceview3
     glib gnome3.defaultIconTheme wrapGAppsHook
   ]
+  ++ optionals (buildIde && stdenv.isDarwin) [
+    darwin.apple_sdk.frameworks.Cocoa
+  ]
   ++ optionals buildDoc [
     # Sphinx doc dependencies
     pkgconfig (python3.withPackages
